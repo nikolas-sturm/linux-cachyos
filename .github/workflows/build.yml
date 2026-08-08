@@ -1,29 +1,31 @@
-name: Build and lint
+name: Build laptop kernel
+
 on:
-  push:
-    paths:
-      - 'linux-cachyos/PKGBUILD'
-      - '.github/workflows/build.yml'
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CCACHE_DIR: /home/builder/.ccache
 
 jobs:
   build:
-    name: linux-cachyos
-    strategy:
-      matrix:
-        toolchain: [gcc, clang]
-
+    name: Zen 4 Clang ThinLTO
     runs-on: ubuntu-latest
     container: archlinux:base-devel
+    timeout-minutes: 360
+
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-    - name: Setup build environment
-      run: |
-          # Use CachyOS repository
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up build environment
+        run: |
           cat << 'EOF' >> /etc/pacman.conf
           [cachyos]
           Server = https://mirror.cachyos.org/repo/x86_64/cachyos
@@ -34,40 +36,48 @@ jobs:
           pacman-key --lsign-key F3B607488DB35A47
           pacman -Syu --noconfirm --needed ccache
 
-          # Setup builder user
           useradd builder -m
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           chmod -R a+rw .
 
-          # Use all threads for building
-          sed -i 's/#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc) -l$(nproc)"/g' /etc/makepkg.conf
-
-          # Setup a packager name to indicate that kernel has built with CI
-          sed -i 's/#PACKAGER=".*"/PACKAGER="CachyOS GitHub Actions"/g' /etc/makepkg.conf
-
-          # Setup ccache
+          sed -i 's/#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc) -l$(nproc)"/' /etc/makepkg.conf
           sed -i 's|!ccache|ccache|' /etc/makepkg.conf
-          sudo -u builder mkdir -p ${{ env.CCACHE_DIR }}
-    - name: Setup ccache
-      id: cache
-      uses: actions/cache@v4
-      with:
-        path: ${{ env.CCACHE_DIR }}
-        key: ccache-${{ matrix.toolchain }}-${{ github.run_id }}
-        restore-keys: |
-          ccache-${{ matrix.toolchain }}
-    - name: Build package (${{ matrix.toolchain }})
-      id: makepkg
-      env:
-        _build_zfs: yes
-        _build_nvidia_open: yes
-        _use_llvm_lto: ${{ matrix.toolchain == 'gcc' && 'none' || 'thin' }}
-      run: |
-          cd "linux-cachyos"
+          sed -i 's/#PACKAGER=".*"/PACKAGER="GitHub Actions laptop build"/' /etc/makepkg.conf
+
+          sudo -H -E -u builder mkdir -p "$CCACHE_DIR"
+          sudo -H -E -u builder ccache --max-size=8G
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-clang-zen4-${{ github.run_id }}
+          restore-keys: |
+            ccache-clang-zen4-
+
+      - name: Build packages
+        working-directory: linux-cachyos
+        env:
+          _build_zfs: no
+          _build_nvidia_open: no
+          _build_r8125: no
+          _use_llvm_lto: thin
+          _processor_opt: zen4
+          _localmodcfg: yes
+          _ci_fast_build: no
+          _laptop_config: yes
+          _reduced_debug_info: yes
+        run: |
+          export _localmodcfg_path="$PWD/laptop-modules"
           sudo -H -E -u builder makepkg --skipchecksums --syncdeps --noconfirm
-    - name: Upload package to artifacts
-      id: upload
-      uses: actions/upload-artifact@v4
-      with:
-        name: linux-cachyos-${{ matrix.toolchain }}
-        path: linux-cachyos/*.pkg.tar.zst*
+          sudo -H -E -u builder ccache --show-stats
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-cachyos-tsc-${{ github.run_number }}
+          path: |
+            linux-cachyos/linux-cachyos-tsc-*.pkg.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

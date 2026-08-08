@@ -128,6 +128,15 @@
 # Build a debug package with non-stripped vmlinux
 : "${_build_debug:=no}"
 
+### Use smaller, faster-building config for upstream CI checks
+: "${_ci_fast_build:=yes}"
+
+### Preserve laptop controls and common removable storage after localmodconfig
+: "${_laptop_config:=no}"
+
+### Reduce compiler debug metadata without changing runtime optimization
+: "${_reduced_debug_info:=no}"
+
 # Enable AUTOFDO_CLANG for the first compilation to create a kernel, which can be used for profiling
 # Workflow:
 # https://cachyos.org/blog/2411-kernel-autofdo/
@@ -173,6 +182,8 @@ else
     _pkgsuffix=cachyos
 fi
 
+# TSC directsync kernel remains installable beside stock CachyOS kernel.
+_pkgsuffix=cachyos-tsc
 pkgbase="linux-$_pkgsuffix"
 _major=7.1
 _minor=6
@@ -312,6 +323,13 @@ prepare() {
         fi
     done
 
+    # Make directsync activity visible in journalctl while validating this machine.
+    grep -Rnl 'pr_debug("TSC direct sync' arch/x86/kernel 2>/dev/null \
+        | xargs -r sed -i 's/pr_debug("TSC direct sync/pr_info("TSC direct sync/'
+
+    echo "Applying TSC directsync forward-port..."
+    python "${startdir}/tsc-directsync-7.1.py" .
+
     echo "Setting config..."
     cp ../config .config
 
@@ -421,7 +439,7 @@ prepare() {
     fi
 
     ### CI-only stuff
-    if _is_ci_build; then
+    if _is_ci_build && [ "$_ci_fast_build" = "yes" ]; then
         echo "Detected build inside CI"
 
         scripts/config \
@@ -429,6 +447,10 @@ prepare() {
             -e CC_OPTIMIZE_FOR_SIZE \
             -d DEBUG_KERNEL \
             -e DEBUG_INFO_REDUCED
+    fi
+
+    if [ "$_reduced_debug_info" = "yes" ]; then
+        scripts/config -e DEBUG_INFO_REDUCED
     fi
 
     ### Enable bbr3
@@ -499,6 +521,18 @@ prepare() {
         else
             _die "No modprobed.db data found"
         fi
+    fi
+
+    if [ "$_laptop_config" = "yes" ]; then
+        scripts/config \
+            -m USB_STORAGE \
+            -m USB_UAS \
+            -m EXFAT_FS \
+            -m NTFS3_FS \
+            -m LENOVO_WMI_HOTKEY_UTILITIES \
+            -m LENOVO_WMI_CAMERA \
+            -m LENOVO_YMC \
+            -m LENOVO_WMI_GAMEZONE
     fi
 
     ### Rewrite configuration
