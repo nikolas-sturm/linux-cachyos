@@ -40,15 +40,20 @@ jobs:
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           chmod -R a+rw .
 
+          sudo -H -u builder gpg --batch --keyserver hkps://keyserver.ubuntu.com \
+            --recv-keys \
+            E18447AC260021D31F3FF6C4C8A2A4774B8B63C4 \
+            E8B9AA39F054E30E8290D492C3C4820857F654FE
+
           sed -i 's/#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc) -l$(nproc)"/' /etc/makepkg.conf
           sed -i 's|!ccache|ccache|' /etc/makepkg.conf
-          sed -i 's/#PACKAGER=".*"/PACKAGER="GitHub Actions laptop build"/' /etc/makepkg.conf
+          sed -i 's/#PACKAGER=".*"/PACKAGER="GitHub Actions <actions@github.com>"/' /etc/makepkg.conf
 
           sudo -H -E -u builder mkdir -p "$CCACHE_DIR"
           sudo -H -E -u builder ccache --max-size=8G
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-clang-zen4-${{ github.run_id }}
@@ -69,7 +74,7 @@ jobs:
           _reduced_debug_info: yes
         run: |
           export _localmodcfg_path="$PWD/laptop-modules"
-          sudo -H -E -u builder makepkg --skipchecksums --syncdeps --noconfirm
+          sudo -H -E -u builder makepkg --syncdeps --noconfirm
           sudo -H -E -u builder ccache --show-stats
 
       - name: Upload packages
