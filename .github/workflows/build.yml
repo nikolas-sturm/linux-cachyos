@@ -72,7 +72,7 @@ jobs:
           pacman-key --init
           pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com
           pacman-key --lsign-key F3B607488DB35A47
-          pacman -Syu --noconfirm --needed ccache github-cli
+          pacman -Syu --noconfirm --needed ccache git github-cli
 
           useradd builder -m
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
@@ -182,6 +182,7 @@ jobs:
           install -m644 "$repo_dir/$PACMAN_REPO.files.tar.gz" "$repo_dir/$PACMAN_REPO.files"
           install -m644 "$repo_dir/$PACMAN_REPO.db.tar.gz.sig" "$repo_dir/$PACMAN_REPO.db.sig"
           install -m644 "$repo_dir/$PACMAN_REPO.files.tar.gz.sig" "$repo_dir/$PACMAN_REPO.files.sig"
+          rm -f "$repo_dir"/*.old
 
       - name: Publish pacman repository
         if: steps.version.outputs.build == 'true'
