@@ -1,10 +1,18 @@
 name: Build laptop kernel
 
 on:
+  schedule:
+    - cron: "23 2 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: Build even when upstream version is unchanged
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -12,19 +20,49 @@ concurrency:
 
 env:
   CCACHE_DIR: /home/builder/.ccache
+  GH_REPO: ${{ github.repository }}
+  PACMAN_REPO: linux-cachyos-tsc
+  PACMAN_GPG_FINGERPRINT: 62F2573FA513AF1B08A419FDA371FE2BF3B218C1
 
 jobs:
   build:
-    name: Zen 4 Clang ThinLTO
+    name: Check and build Zen 4 kernel
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     timeout-minutes: 360
 
     steps:
-      - name: Checkout
+      - name: Checkout downstream customization
         uses: actions/checkout@v6
+        with:
+          path: downstream
+
+      - name: Checkout current CachyOS source
+        uses: actions/checkout@v6
+        with:
+          repository: CachyOS/linux-cachyos
+          ref: master
+          path: upstream
+
+      - name: Check upstream version
+        id: version
+        run: |
+          cp downstream/linux-cachyos/tsc-directsync-7.1.py upstream/linux-cachyos/
+          version="$(python downstream/.github/scripts/prepare-pkgbuild.py \
+            --print-version upstream/linux-cachyos/PKGBUILD)"
+          current="$(<downstream/.github/latest-kernel)"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" != "$current" || "${{ inputs.force }}" == "true" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Building upstream $version (last published: $current)"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream $version is already published"
+          fi
 
       - name: Set up build environment
+        if: steps.version.outputs.build == 'true'
         run: |
           cat << 'EOF' >> /etc/pacman.conf
           [cachyos]
@@ -34,11 +72,11 @@ jobs:
           pacman-key --init
           pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com
           pacman-key --lsign-key F3B607488DB35A47
-          pacman -Syu --noconfirm --needed ccache
+          pacman -Syu --noconfirm --needed ccache github-cli
 
           useradd builder -m
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          chmod -R a+rw .
+          chmod -R a+rw "$GITHUB_WORKSPACE"
 
           sudo -H -u builder gpg --batch --keyserver hkps://keyserver.ubuntu.com \
             --recv-keys \
@@ -47,12 +85,13 @@ jobs:
 
           sed -i 's/#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc) -l$(nproc)"/' /etc/makepkg.conf
           sed -i 's|!ccache|ccache|' /etc/makepkg.conf
-          sed -i 's/#PACKAGER=".*"/PACKAGER="GitHub Actions <actions@github.com>"/' /etc/makepkg.conf
+          sed -i 's/#PACKAGER=".*"/PACKAGER="CachyOS TSC CI <nikolas-sturm@users.noreply.github.com>"/' /etc/makepkg.conf
 
           sudo -H -E -u builder mkdir -p "$CCACHE_DIR"
           sudo -H -E -u builder ccache --max-size=8G
 
       - name: Restore compiler cache
+        if: steps.version.outputs.build == 'true'
         uses: actions/cache@v5
         with:
           path: ${{ env.CCACHE_DIR }}
@@ -61,7 +100,8 @@ jobs:
             ccache-clang-zen4-
 
       - name: Build packages
-        working-directory: linux-cachyos
+        if: steps.version.outputs.build == 'true'
+        working-directory: upstream/linux-cachyos
         env:
           _build_zfs: no
           _build_nvidia_open: no
@@ -74,12 +114,108 @@ jobs:
           sudo -H -E -u builder makepkg --syncdeps --noconfirm
           sudo -H -E -u builder ccache --show-stats
 
-      - name: Upload packages
+      - name: Verify packages
+        if: steps.version.outputs.build == 'true'
+        run: |
+          kernel_pkg=(upstream/linux-cachyos/linux-cachyos-tsc-[0-9]*-x86_64.pkg.tar.zst)
+          headers_pkg=(upstream/linux-cachyos/linux-cachyos-tsc-headers-[0-9]*-x86_64.pkg.tar.zst)
+          [[ -f "${kernel_pkg[0]}" && -f "${headers_pkg[0]}" ]]
+
+          release="${{ steps.version.outputs.version }}-cachyos-tsc"
+          bsdtar -xOf "${headers_pkg[0]}" \
+            "usr/lib/modules/$release/build/.config" > "$RUNNER_TEMP/kernel.config"
+
+          for symbol in \
+            CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=y \
+            CONFIG_MZEN4=y \
+            CONFIG_LTO_CLANG_THIN=y \
+            CONFIG_BLK_DEV_DM=m \
+            CONFIG_CRYPTO_LZ4=m \
+            CONFIG_OVERLAY_FS=m \
+            CONFIG_SQUASHFS=m \
+            CONFIG_ZRAM=m; do
+            grep -qx "$symbol" "$RUNNER_TEMP/kernel.config"
+          done
+
+          grep -q 'tsc_allow_direct_sync' \
+            upstream/linux-cachyos/src/cachyos-*/arch/x86/kernel/tsc_sync.c
+
+      - name: Sign packages and create repository database
+        if: steps.version.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACMAN_GPG_PRIVATE_KEY: ${{ secrets.PACMAN_GPG_PRIVATE_KEY }}
+        run: |
+          [[ -n "$PACMAN_GPG_PRIVATE_KEY" ]]
+          printf '%s' "$PACMAN_GPG_PRIVATE_KEY" \
+            | sudo -H -u builder gpg --batch --import
+
+          packages=(upstream/linux-cachyos/linux-cachyos-tsc-*.pkg.tar.zst)
+          for package in "${packages[@]}"; do
+            sudo -H -u builder gpg --batch --yes \
+              --local-user "$PACMAN_GPG_FINGERPRINT" \
+              --detach-sign "$package"
+          done
+
+          repo_dir="$RUNNER_TEMP/pacman-repo"
+          install -d -o builder -g builder "$repo_dir"
+          cp "${packages[@]}" upstream/linux-cachyos/*.pkg.tar.zst.sig "$repo_dir/"
+          cp downstream/linux-cachyos-tsc-signing-key.asc "$repo_dir/"
+
+          if gh release view repo >/dev/null 2>&1; then
+            gh release download repo \
+              --pattern "$PACMAN_REPO.db.tar.gz" \
+              --dir "$repo_dir" || true
+          fi
+          chown -R builder:builder "$repo_dir"
+
+          sudo -H -u builder repo-add --sign --key "$PACMAN_GPG_FINGERPRINT" \
+            "$repo_dir/$PACMAN_REPO.db.tar.gz" \
+            "$repo_dir"/*.pkg.tar.zst
+
+          rm -f \
+            "$repo_dir/$PACMAN_REPO.db" \
+            "$repo_dir/$PACMAN_REPO.db.sig" \
+            "$repo_dir/$PACMAN_REPO.files" \
+            "$repo_dir/$PACMAN_REPO.files.sig"
+          install -m644 "$repo_dir/$PACMAN_REPO.db.tar.gz" "$repo_dir/$PACMAN_REPO.db"
+          install -m644 "$repo_dir/$PACMAN_REPO.files.tar.gz" "$repo_dir/$PACMAN_REPO.files"
+          install -m644 "$repo_dir/$PACMAN_REPO.db.tar.gz.sig" "$repo_dir/$PACMAN_REPO.db.sig"
+          install -m644 "$repo_dir/$PACMAN_REPO.files.tar.gz.sig" "$repo_dir/$PACMAN_REPO.files.sig"
+
+      - name: Publish pacman repository
+        if: steps.version.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view repo >/dev/null 2>&1; then
+            gh release create repo \
+              --target master \
+              --title "CachyOS TSC binary repository" \
+              --notes "Signed pacman repository for automated CachyOS TSC kernel builds."
+          fi
+          gh release upload repo "$RUNNER_TEMP/pacman-repo"/* --clobber
+
+      - name: Upload workflow artifact
+        if: steps.version.outputs.build == 'true'
         uses: actions/upload-artifact@v5
         with:
-          name: linux-cachyos-tsc-${{ github.run_number }}
+          name: linux-cachyos-tsc-${{ steps.version.outputs.version }}
           path: |
-            linux-cachyos/linux-cachyos-tsc-*.pkg.tar.zst
+            upstream/linux-cachyos/linux-cachyos-tsc-*.pkg.tar.zst*
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+      - name: Record published version
+        if: steps.version.outputs.build == 'true'
+        working-directory: downstream
+        run: |
+          printf '%s\n' "${{ steps.version.outputs.version }}" > .github/latest-kernel
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/latest-kernel
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: record kernel ${{ steps.version.outputs.version }}"
+            git push origin HEAD:master
+          fi
