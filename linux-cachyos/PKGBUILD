@@ -131,9 +131,6 @@
 ### Use smaller, faster-building config for upstream CI checks
 : "${_ci_fast_build:=yes}"
 
-### Preserve laptop controls and common removable storage after localmodconfig
-: "${_laptop_config:=no}"
-
 ### Reduce compiler debug metadata without changing runtime optimization
 : "${_reduced_debug_info:=no}"
 
@@ -521,18 +518,6 @@ prepare() {
         else
             _die "No modprobed.db data found"
         fi
-    fi
-
-    if [ "$_laptop_config" = "yes" ]; then
-        scripts/config \
-            -m USB_STORAGE \
-            -m USB_UAS \
-            -m EXFAT_FS \
-            -m NTFS3_FS \
-            -m LENOVO_WMI_HOTKEY_UTILITIES \
-            -m LENOVO_WMI_CAMERA \
-            -m LENOVO_YMC \
-            -m LENOVO_WMI_GAMEZONE
     fi
 
     ### Rewrite configuration

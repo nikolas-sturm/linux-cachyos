@@ -68,12 +68,9 @@ jobs:
           _build_r8125: no
           _use_llvm_lto: thin
           _processor_opt: zen4
-          _localmodcfg: yes
           _ci_fast_build: no
-          _laptop_config: yes
           _reduced_debug_info: yes
         run: |
-          export _localmodcfg_path="$PWD/laptop-modules"
           sudo -H -E -u builder makepkg --syncdeps --noconfirm
           sudo -H -E -u builder ccache --show-stats
 
